@@ -1,0 +1,12 @@
+{
+  "ROOT_DIR": "./",
+  "MODEL_PATH": "train/reversi_gnn.pt",
+  "LOG_DIR": "logs",
+  "TRAIN_DIR": "train",
+  "NUM_SELF_PLAY_GAMES": 1000,
+  "NUM_EPOCHS": 10,
+  "LEARNING_RATE": 0.001,
+  "BOARD_SIZE": 8,
+  "MODEL_HIDDEN_CHANNELS": 64,
+  "MODEL_OUTPUT_DIM": 1
+}
