@@ -46,8 +46,6 @@ def main():
     visualizer = ReversiVisualizer() if use_gui else None
     train_gnn(num_games=n, visualizer=visualizer)
     
-    visualizer.window.close()
-
     update_self_train_info(n)
     
     print("Training completed. Now starting human vs AI game.")
