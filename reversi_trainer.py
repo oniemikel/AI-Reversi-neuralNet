@@ -1,3 +1,4 @@
+# reversi_trainer.py
 import os
 import torch
 import torch.nn.functional as F
@@ -11,60 +12,70 @@ from reversi_game_logic import (
     get_edge_index,
 )
 from reversi_gnn_model import ReversiGNN
-from config import MODEL_PATH
+from config import MODEL_PATH, BOARD_SIZE
 from reversi_utils import print_board
 from elo_rating import EloRating, update_elo_from_match_results
 
 
 def board_to_tensor(board, player):
+    """
+    board: numpy array (BOARD_SIZE, BOARD_SIZE)
+    player: 1 or -1
+    returns: torch.Tensor([num_nodes, in_channels]) float32
+    """
     return torch.tensor((board * player).flatten(), dtype=torch.float32).unsqueeze(1)
 
 
-def select_action(model, board, player, edge_index):
-    x = board_to_tensor(board, player)
+def select_action(model, board, player, edge_index, device="cpu", deterministic=False):
+    """
+    model: ReversiGNN
+    board: numpy array
+    player: 1 or -1
+    deterministic: True -> argmax (評価時)、False -> sampling (学習時)
+    returns: (r, c) or None if no moves
+    """
+    x = board_to_tensor(board, player).to(device)
     model.eval()
     with torch.no_grad():
-        logits = model(x, edge_index)
+        logits = model(x, edge_index.to(device))
 
-    assert (
-        logits.dim() == 1 and logits.shape[0] == 64
-    ), "logitsの形状が異常です。64次元であるべき。"
+    assert logits.dim() == 1 and logits.shape[0] == BOARD_SIZE * BOARD_SIZE, "logits の形状が異常です。"
 
     moves = valid_moves(board, player)
     if not moves:
         return None
 
-    mask = torch.zeros_like(logits)
+    # mask illegal moves
+    mask = torch.zeros_like(logits, dtype=torch.bool)
     for r, c in moves:
-        idx = r * 8 + c
-        mask[idx] = 1
+        idx = r * BOARD_SIZE + c
+        mask[idx] = True
 
     masked_logits = logits.clone()
-    masked_logits[mask == 0] = -1e9
+    masked_logits[~mask] = -1e9
 
-    max_val = masked_logits.max()
-    if max_val < -1e8:
-        masked_logits = torch.where(
-            mask.bool(),
-            torch.zeros_like(masked_logits),
-            torch.full_like(masked_logits, -1e9),
-        )
+    if deterministic:
+        action_idx = int(torch.argmax(masked_logits).item())
     else:
-        masked_logits -= max_val
+        # numerical stability
+        m = masked_logits - masked_logits.max()
+        probs = torch.softmax(m, dim=0)
+        if torch.isnan(probs).any() or probs.sum() < 1e-8:
+            # fallback uniform over legal
+            probs = torch.zeros_like(probs)
+            probs[mask] = 1.0
+            probs = probs / probs.sum()
+        action_idx = int(torch.multinomial(probs, 1).item())
 
-    probs = torch.softmax(masked_logits, dim=0)
-
-    if torch.isnan(probs).any() or probs.sum() < 1e-8:
-        uniform_probs = torch.zeros_like(probs)
-        uniform_probs[mask == 1] = 1.0
-        uniform_probs /= uniform_probs.sum()
-        probs = uniform_probs
-
-    action_idx = torch.multinomial(probs, 1).item()
-    return action_idx // 8, action_idx % 8
+    return action_idx // BOARD_SIZE, action_idx % BOARD_SIZE
 
 
-def train_gnn(num_games=1000, print_every=1, external_history=None, visualizer=None):
+def train_gnn(num_games=1000, print_every=10, external_history=None, visualizer=None):
+    """
+    REINFORCE ベースの自己対戦学習を行う実装。
+    - external_history: [(x_tensor, action_idx, player), ...] を渡すと模倣学習的に1局分だけ更新する（GUI微調整用）
+    - 戦略: 各局面での log_prob を蓄え、ゲーム終了時に勝敗に基づく報酬で一括更新する（モンテカルロ方策勾配）
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ReversiGNN().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
@@ -72,16 +83,14 @@ def train_gnn(num_games=1000, print_every=1, external_history=None, visualizer=N
 
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
 
-    # --- 人間対戦など外部履歴からの追加学習 ---
+    # external_history による微調整（既存挙動を保つ）
     if external_history is not None:
         model.train()
         for x, action_idx, player in external_history:
             x = x.to(device)
             optimizer.zero_grad()
             logits = model(x, edge_index)
-            loss = F.cross_entropy(
-                logits.unsqueeze(0), torch.tensor([action_idx], device=device)
-            )
+            loss = F.cross_entropy(logits.unsqueeze(0), torch.tensor([action_idx], device=device))
             loss.backward()
             optimizer.step()
 
@@ -89,10 +98,15 @@ def train_gnn(num_games=1000, print_every=1, external_history=None, visualizer=N
         print(f"Model updated from external history and saved to {MODEL_PATH}")
         return model
 
-    # --- 自己対戦学習ループ ---
+    # --- 自己対戦学習（REINFORCE） ---
     for game in range(num_games):
         board = init_board()
         player = 1
+
+        # 一局分の記録
+        log_probs = []
+        actions = []
+        players = []
 
         while not is_game_over(board):
             moves = valid_moves(board, player)
@@ -104,50 +118,91 @@ def train_gnn(num_games=1000, print_every=1, external_history=None, visualizer=N
             model.train()
             logits = model(x, edge_index)
 
-            # 有効手の中から最も確率の高い行動を選択
-            logits_np = logits.cpu().detach().numpy()
-            move_indices = [r * 8 + c for r, c in moves]
-            mask = np.full(64, -1e9, dtype=np.float32)
-            for idx in move_indices:
-                mask[idx] = logits_np[idx]
-            probs = F.softmax(torch.tensor(mask), dim=0).numpy()
-            action_idx = np.random.choice(64, p=probs)
-            r, c = divmod(action_idx, 8)
+            # マスクして確率を得る
+            mask = torch.zeros_like(logits, dtype=torch.bool)
+            for r, c in moves:
+                idx = r * BOARD_SIZE + c
+                mask[idx] = True
 
-            # 損失と更新
-            optimizer.zero_grad()
-            loss = F.cross_entropy(
-                logits.unsqueeze(0), torch.tensor([action_idx], device=device)
-            )
-            loss.backward()
-            optimizer.step()
+            masked_logits = logits.clone()
+            masked_logits[~mask] = -1e9
+            m = masked_logits - masked_logits.max()
+            probs = torch.softmax(m, dim=0)
 
+            # 防御: nan または sum が小さい場合は均等に
+            if torch.isnan(probs).any() or probs.sum() < 1e-8:
+                probs = torch.zeros_like(probs)
+                probs[mask] = 1.0
+                probs = probs / probs.sum()
+
+            # サンプリングして行動選択（学習時は確率的に）
+            action_idx = int(torch.multinomial(probs, 1).item())
+            log_prob = torch.log(probs[action_idx] + 1e-12)
+
+            # 記録
+            log_probs.append(log_prob)
+            actions.append(action_idx)
+            players.append(player)
+
+            # 実行
+            r, c = divmod(action_idx, BOARD_SIZE)
             board = make_move(board, (r, c), player)
             player *= -1
 
-        # GUIがあれば最終盤面を更新（毎手でなく1局単位で）
+        # 対局終局時に報酬を決定（勝者:+1, 敗者:-1, 引き分け:0）
+        black_count = np.sum(board == 1)
+        white_count = np.sum(board == -1)
+        if black_count > white_count:
+            reward_for_black = 1.0
+            reward_for_white = -1.0
+        elif white_count > black_count:
+            reward_for_black = -1.0
+            reward_for_white = 1.0
+        else:
+            reward_for_black = 0.0
+            reward_for_white = 0.0
+
+        # 各手に対応する報酬（プレイヤーに応じて +1/-1/0）
+        returns = []
+        for p in players:
+            returns.append(reward_for_black if p == 1 else reward_for_white)
+        returns = torch.tensor(returns, dtype=torch.float32, device=device)
+
+        # 基準（baseline）として平均を引いて分散を下げる（簡易）
+        baseline = returns.mean() if len(returns) > 0 else 0.0
+        advantages = returns - baseline
+
+        # 損失 = - Σ (adv * log_prob)
+        loss = -torch.sum(advantages * torch.stack(log_probs).to(device))
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # GUI 更新（あれば）
         if visualizer:
             visualizer.update(board)
 
-        if (game + 1) % print_every == 0:
-            print(f"Game {game+1} / {num_games}")
+        if (game + 1) % print_every == 0 or game == 0:
+            print(f"Game {game+1} / {num_games}  |  loss: {loss.item():.4f}  |  black: {black_count} white: {white_count}")
 
+    # モデル保存
     torch.save(model.state_dict(), MODEL_PATH)
     print(f"Model saved to {MODEL_PATH}")
     return model
 
 
-def evaluate_models(model_a, model_b, num_games=20):
+def evaluate_models(model_a, model_b, num_games=20, device="cpu"):
     """
-    model_a と model_b を対戦させて結果を返す。
-    結果は model_a の視点からの勝ち(1), 引き分け(0.5), 負け(0) のリスト。
+    model_a (先手) と model_b (後手) を対戦させ、model_a 視点のスコアを返すリスト。
+    1.0 = model_a の勝ち, 0.5 = 引き分け, 0.0 = model_a の負け
     """
-
     results = []
 
-    for _ in range(num_games):
+    for g in range(num_games):
         board = init_board()
-        player = 1  # 先手は model_a とする
+        player = 1  # 先手は model_a
+        models = {1: model_a, -1: model_b}
 
         while not is_game_over(board):
             moves = valid_moves(board, player)
@@ -155,11 +210,7 @@ def evaluate_models(model_a, model_b, num_games=20):
                 player *= -1
                 continue
 
-            if player == 1:
-                action = select_action(model_a, board, player, get_edge_index())
-            else:
-                action = select_action(model_b, board, player, get_edge_index())
-
+            action = select_action(models[player], board, player, get_edge_index(), device=device, deterministic=True)
             if action is None:
                 player *= -1
                 continue
@@ -167,13 +218,13 @@ def evaluate_models(model_a, model_b, num_games=20):
             board = make_move(board, action, player)
             player *= -1
 
-        # 勝敗判定
         black_count = np.sum(board == 1)
         white_count = np.sum(board == -1)
         if black_count > white_count:
-            results.append(1 if player == -1 else 0)  # playerが反転しているため逆転注意
+            # 先手（model_a）が黒なので、黒勝ち => model_a 勝ち
+            results.append(1.0)
         elif white_count > black_count:
-            results.append(0 if player == -1 else 1)
+            results.append(0.0)
         else:
             results.append(0.5)
 
@@ -186,6 +237,9 @@ def train_loop(
     eval_games=20,
     print_every=1,
 ):
+    """
+    サイクルごとに学習 -> 評価 -> ELO 更新 を行う簡易ループ。
+    """
     elo = EloRating()
     elo.add_player("baseline", 1200)
     elo.add_player("current", 1200)
@@ -201,19 +255,19 @@ def train_loop(
     current_model = ReversiGNN()
     current_model.load_state_dict(torch.load(MODEL_PATH))
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     for cycle in range(1, total_cycles + 1):
         print(f"===== Training cycle {cycle} =====")
 
-        # 学習
+        # 学習（自己対戦）
         current_model = train_gnn(num_games=games_per_cycle, print_every=print_every)
 
-        # baselineモデルは直前のcurrent_modelを保存したものを使う
-        torch.save(current_model.state_dict(), MODEL_PATH)
-
-        # 評価
+        # 現在モデルを評価対象（先手）として評価
+        # baseline_model は以前の保存モデル（ここでは MODEL_PATH を上書きしているため、ロードして比較）
         baseline_model.load_state_dict(torch.load(MODEL_PATH))
 
-        results = evaluate_models(current_model, baseline_model, num_games=eval_games)
+        results = evaluate_models(current_model, baseline_model, num_games=eval_games, device=device)
 
         update_elo_from_match_results(elo, "current", "baseline", results)
 
