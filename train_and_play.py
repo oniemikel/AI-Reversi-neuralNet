@@ -8,17 +8,17 @@ import os
 TRAIN_INFO_PATH = "./train/train_info.json"
 
 
-def update_self_train_info(add_num: int) -> None:
-    """train_info.json の self_train_info を add_num 分だけ加算する"""
+def update_self_train_time(add_num: int) -> None:
+    """train_info.json の self_train_time を add_num 分だけ加算する"""
     # ファイルがない場合は初期化
     if not os.path.exists(TRAIN_INFO_PATH):
-        data = {"self_train_info": 0}
+        data = {"self_train_time": 0}
     else:
         with open(TRAIN_INFO_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
 
     # 値を加算
-    data["self_train_info"] = data.get("self_train_info", 0) + add_num
+    data["self_train_time"] = data.get("self_train_time", 0) + add_num
 
     # 保存
     with open(TRAIN_INFO_PATH, "w", encoding="utf-8") as f:
@@ -46,7 +46,7 @@ def main():
     visualizer = ReversiVisualizer() if use_gui else None
     train_gnn(num_games=n, visualizer=visualizer)
     
-    update_self_train_info(n)
+    update_self_train_time(n)
     
     print("Training completed. Now starting human vs AI game.")
     while True:
