@@ -10,14 +10,12 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 from PyQt5.QtCore import Qt
-
+from save_train_time import update_play_train_time
 from reversi_game_logic import init_board, valid_moves, make_move, is_game_over
 from reversi_cli import select_action, load_model, get_edge_index, board_to_tensor
-from reversi_trainer import train_gnn
+from reversi_trainer import train_gnn_external_only
 
 BOARD_SIZE = 8
-
-# reversi_gui.py に追加（main()の前に）
 
 
 class ReversiVisualizer:
@@ -36,10 +34,8 @@ class ReversiVisualizer:
         for r in range(BOARD_SIZE):
             for c in range(BOARD_SIZE):
                 label = self.buttons[r][c]
-                label.setFixedSize(60, 60)  # ReversiGUIに合わせてサイズ大きめに
+                label.setFixedSize(60, 60)
                 label.setAlignment(Qt.AlignCenter)
-
-                # 初期状態のスタイル
                 label.setStyleSheet(
                     """
                     background-color: #2e7d32;
@@ -51,9 +47,7 @@ class ReversiVisualizer:
                 )
                 self.grid.addWidget(label, r, c)
 
-        self.window.setStyleSheet(
-            "background-color: #1b5e20;"
-        )  # ウィンドウ背景を深緑に
+        self.window.setStyleSheet("background-color: #1b5e20;")
         self.window.show()
 
     def update(self, board):
@@ -98,14 +92,10 @@ class ReversiGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Reversi with PyQt")
-        self.setStyleSheet("background-color: #1b5e20;")  # ウィンドウ背景を深緑に
+        self.setStyleSheet("background-color: #1b5e20;")
 
-        self.board = init_board()
-        self.player = 1
         self.model = load_model()
         self.edge_index = get_edge_index()
-
-        self.history = []  # 人間対戦の学習履歴（盤面テンソル, 行動インデックス, プレイヤー）
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -118,11 +108,11 @@ class ReversiGUI(QMainWindow):
             font-weight: bold;
             color: white;
             padding: 10px;
-        """
+            """
         )
 
         self.grid = QGridLayout()
-        self.grid.setSpacing(1)  # 升目間の隙間を最小限に
+        self.grid.setSpacing(1)
 
         self.buttons = [
             [QPushButton() for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)
@@ -135,11 +125,34 @@ class ReversiGUI(QMainWindow):
                 btn.clicked.connect(self.make_move_closure(r, c))
                 self.grid.addWidget(btn, r, c)
 
+        # もう一度対戦ボタン
+        self.restart_button = QPushButton("Play Again")
+        self.restart_button.setStyleSheet(
+            """
+            background-color: #4caf50;
+            color: white;
+            font-size: 20px;
+            padding: 8px;
+            border-radius: 6px;
+            """
+        )
+        self.restart_button.clicked.connect(self.reset_game)
+        self.restart_button.hide()  # ゲーム終了時にのみ表示
+
         layout = QVBoxLayout()
         layout.addWidget(self.status_label)
         layout.addLayout(self.grid)
+        layout.addWidget(self.restart_button)
         self.central_widget.setLayout(layout)
 
+        self.reset_game()
+
+    def reset_game(self):
+        self.board = init_board()
+        self.player = 1
+        self.history = []
+        self.restart_button.hide()
+        self.status_label.setText("Your turn (Black ●)")
         self.update_board()
 
     def make_move_closure(self, r, c):
@@ -150,7 +163,6 @@ class ReversiGUI(QMainWindow):
                 self.status_label.setText("Invalid move! Try again.")
                 return
 
-            # 学習用履歴に人間の手を記録
             x = board_to_tensor(self.board, self.player)
             action_idx = r * 8 + c
             self.history.append((x, action_idx, self.player))
@@ -187,8 +199,6 @@ class ReversiGUI(QMainWindow):
             self.status_label.setText("AI passed. Your turn (Black ●)")
             self.player *= -1
             self.update_board()
-            if not valid_moves(self.board, self.player):
-                self.finish_game()
             return
 
         r, c = select_action(self.model, self.board, self.player, self.edge_index)
@@ -204,9 +214,7 @@ class ReversiGUI(QMainWindow):
             self.status_label.setText("You have no valid moves. Passing turn to AI.")
             self.player *= -1
             self.update_board()
-            if not valid_moves(self.board, self.player):
-                self.finish_game()
-            else:
+            if valid_moves(self.board, self.player):
                 QApplication.processEvents()
                 self.ai_move()
         else:
@@ -223,8 +231,6 @@ class ReversiGUI(QMainWindow):
                     border: 1px solid #1b5e20;
                     font-size: 40px;
                     font-weight: bold;
-                    padding: 0px;
-                    margin: 0px;
                 """
 
                 if val == 1:
@@ -255,19 +261,23 @@ class ReversiGUI(QMainWindow):
 
         score_msg = f"""
             <div style='font-size:18px;'>
-                <span style='color: black; padding: 2px 6px; border-radius: 4px;'>●: {black_count}</span>
+                <span style='color: black;'>●: {black_count}</span>
                 &nbsp;
-                <span style='color: white; padding: 2px 6px; border-radius: 4px;'>●: {white_count}</span>
+                <span style='color: white;'>●: {white_count}</span>
             </div>
         """
 
         self.status_label.setText(f"<b>{result_msg}</b><br>{score_msg}")
+
         for r in range(BOARD_SIZE):
             for c in range(BOARD_SIZE):
                 self.buttons[r][c].setEnabled(False)
 
-        # 対局終了後に人間対戦データで軽量学習を行う
-        train_gnn(num_games=1, external_history=self.history)
+        train_gnn_external_only(self.history)
+
+        update_play_train_time(1)
+
+        self.restart_button.show()
 
 
 def main():

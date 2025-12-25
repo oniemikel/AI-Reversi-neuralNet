@@ -70,6 +70,135 @@ def select_action(model, board, player, edge_index, device="cpu", deterministic=
     return action_idx // BOARD_SIZE, action_idx % BOARD_SIZE
 
 
+def train_gnn_one_game(model=None, optimizer=None, visualizer=None):
+    """
+    REINFORCE による 1 ゲームだけの自己対戦学習
+    model, optimizer を外から受け取る形式にする（状態を保持するため）
+    戻り値: (model, optimizer)
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # モデル・optimizer を外部から受け取り、なければ初期化
+    if model is None:
+        model = ReversiGNN().to(device)
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+
+    edge_index = get_edge_index().to(device)
+
+    board = init_board()
+    player = 1
+
+    log_probs = []
+    players = []
+
+    # ---- 1ゲーム進行 ----
+    while not is_game_over(board):
+        moves = valid_moves(board, player)
+        if not moves:
+            player *= -1
+            continue
+
+        x = board_to_tensor(board, player).to(device)
+        model.train()
+        logits = model(x, edge_index)
+
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        for r, c in moves:
+            idx = r * BOARD_SIZE + c
+            mask[idx] = True
+
+        masked_logits = logits.clone()
+        masked_logits[~mask] = -1e9
+        m = masked_logits - masked_logits.max()
+        probs = torch.softmax(m, dim=0)
+
+        if torch.isnan(probs).any() or probs.sum() < 1e-8:
+            probs = torch.zeros_like(probs)
+            probs[mask] = 1.0
+            probs = probs / probs.sum()
+
+        action_idx = int(torch.multinomial(probs, 1).item())
+        log_prob = torch.log(probs[action_idx] + 1e-12)
+
+        log_probs.append(log_prob)
+        players.append(player)
+
+        r, c = divmod(action_idx, BOARD_SIZE)
+        board = make_move(board, (r, c), player)
+        player *= -1
+
+    # ---- 勝敗判定 ----
+    black_count = np.sum(board == 1)
+    white_count = np.sum(board == -1)
+
+    if black_count > white_count:
+        reward_black = 1.0
+        reward_white = -1.0
+    elif white_count > black_count:
+        reward_black = -1.0
+        reward_white = 1.0
+    else:
+        reward_black = 0.0
+        reward_white = 0.0
+
+    returns = []
+    for p in players:
+        returns.append(reward_black if p == 1 else reward_white)
+    returns = torch.tensor(returns, dtype=torch.float32, device=device)
+
+    baseline = returns.mean() if len(returns) > 0 else 0.0
+    advantages = returns - baseline
+
+    loss = -torch.sum(advantages * torch.stack(log_probs).to(device))
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if visualizer:
+        visualizer.update(board)
+
+    return model, optimizer
+
+
+def train_gnn_external_only(external_history):
+    """
+    GUI での 1 ゲーム終了後に、human vs AI の履歴を元に微調整する専用関数。
+    - 必ず既存モデルをロードする
+    - 1 ステップだけ学習する
+    - 毎回保存する
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = ReversiGNN().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    edge_index = get_edge_index().to(device)
+
+    # 既存モデルの読み込み
+    if os.path.exists(MODEL_PATH):
+        model.load_state_dict(torch.load(MODEL_PATH))
+
+    model.train()
+    for x, action_idx, player in external_history:
+        x = x.to(device)
+        optimizer.zero_grad()
+
+        logits = model(x, edge_index)
+        loss = F.cross_entropy(
+            logits.unsqueeze(0),
+            torch.tensor([action_idx], dtype=torch.long, device=device),
+        )
+        loss.backward()
+        optimizer.step()
+
+    # 必ず保存
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"Model updated from GUI play and saved to {MODEL_PATH}")
+
+    return model
+
+
 def train_gnn(num_games=1000, print_every=10, external_history=None, visualizer=None):
     """
     REINFORCE ベースの自己対戦学習を行う実装。
